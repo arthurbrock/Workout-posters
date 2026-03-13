@@ -112,6 +112,36 @@ const CSS = `
 `;
 
 
+// ── Strava ──────────────────────────────────────────────────────────────────
+const STRAVA_CLIENT_ID     = "58825";
+const STRAVA_CLIENT_SECRET = "bba7656c9258a34752c3626219681c6bb46a191b";
+const STRAVA_REDIRECT_URI  = window.location.origin + window.location.pathname;
+const STRAVA_SCOPE         = "activity:read_all";
+
+function stravaToWorkout(a) {
+  const typeMap = { Run:"running", Ride:"cycling", Hike:"hiking", Walk:"hiking",
+                    VirtualRun:"running", VirtualRide:"cycling", Swim:"swimming" };
+  const dist = (a.distance || 0) / 1000;
+  const pace = dist > 0 ? Math.round((a.moving_time || 0) / dist) : 0;
+  return {
+    id: a.id, stravaId: a.id,
+    type: typeMap[a.sport_type] || "running",
+    name: a.name || "Untitled",
+    city: a.location_city || a.location_country || "",
+    date: (a.start_date_local || "").slice(0, 10),
+    distance: Math.round(dist * 10) / 10,
+    duration: a.moving_time || 0,
+    avgHR: Math.round(a.average_heartrate || 0),
+    maxHR: Math.round(a.max_heartrate || 0),
+    avgPace: pace,
+    calories: Math.round(a.calories || (a.kilojoules || 0) * 0.239),
+    elevGain: Math.round(a.total_elevation_gain || 0),
+    splits: (a.splits_metric || []).map(s =>
+      s.distance > 0 ? Math.round(s.moving_time / (s.distance / 1000)) : 0),
+    route: null,
+  };
+}
+
 // ── Data ───────────────────────────────────────────────────────────────────
 const WORKOUTS = [
   { id:1, type:"running",  name:"Morning 10K",     city:"São Paulo",   date:"2025-03-14", distance:10.2, duration:3180,  avgHR:158, maxHR:178, avgPace:312, calories:612,  elevGain:124, splits:[5.08,5.12,5.10,5.02,4.58,4.55,5.15,4.48,4.52,4.45] },
@@ -842,9 +872,10 @@ function App() {
   // If a URL workout came in, prepend it to the list
   const [gpxWorkout, setGpxWorkout] = useState(null);
   const gpxFileRef = useRef(null);
+  const [stravaActs, setStravaActs] = useState([]);
   const WORKOUTS_EFF = useMemo(() =>
-    [gpxWorkout, urlWorkout].filter(Boolean).concat(WORKOUTS)
-  , [gpxWorkout, urlWorkout]);
+    [gpxWorkout, urlWorkout].filter(Boolean).concat(stravaActs.length ? stravaActs : WORKOUTS)
+  , [gpxWorkout, urlWorkout, stravaActs]);
 
   const [idx,setIdx]               = useState(() => prefs.idx ?? 0);
   const [comboIdx,setComboIdx]     = useState(() => prefs.comboIdx ?? 0);
@@ -859,6 +890,14 @@ function App() {
   const [customBg, setCustomBg]       = useState(null);
   const [formatIdx, setFormatIdx]     = useState(() => prefs.formatIdx ?? 0);
   const fmt = FORMATS[formatIdx];
+  const [stravaToken, setStravaToken] = useState(() => {
+    const t = localStorage.getItem("strava_token");
+    const exp = localStorage.getItem("strava_token_expiry");
+    if (!t || !exp) return null;
+    if (Date.now() / 1000 > Number(exp)) { localStorage.removeItem("strava_token"); return null; }
+    return t;
+  });
+  const [stravaLoading, setStravaLoading] = useState(false);
 
   const w     = WORKOUTS_EFF[workoutIdx] ?? WORKOUTS_EFF[0];
   const style = STYLES[idx].id;
@@ -873,6 +912,62 @@ function App() {
 
   // Reset customCity when workout changes
   useEffect(() => { setCustomCity(""); }, [workoutIdx]);
+
+  // Strava: handle OAuth callback (?code= in URL after redirect)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get("code");
+    if (!code) return;
+    window.history.replaceState({}, "", window.location.pathname);
+    setStravaLoading(true);
+    fetch("https://www.strava.com/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ client_id: STRAVA_CLIENT_ID, client_secret: STRAVA_CLIENT_SECRET, code, grant_type: "authorization_code" }),
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (data.access_token) {
+        localStorage.setItem("strava_token", data.access_token);
+        localStorage.setItem("strava_token_expiry", data.expires_at);
+        setStravaToken(data.access_token);
+      } else { setStravaLoading(false); }
+    })
+    .catch(() => setStravaLoading(false));
+  }, []);
+
+  // Strava: fetch recent activities when token is available
+  useEffect(() => {
+    if (!stravaToken) return;
+    setStravaLoading(true);
+    fetch("https://www.strava.com/api/v3/athlete/activities?per_page=25", {
+      headers: { Authorization: `Bearer ${stravaToken}` },
+    })
+    .then(r => {
+      if (r.status === 401) { localStorage.removeItem("strava_token"); setStravaToken(null); throw new Error("Unauthorized"); }
+      return r.json();
+    })
+    .then(acts => { if (Array.isArray(acts)) setStravaActs(acts.map(stravaToWorkout)); setStravaLoading(false); })
+    .catch(() => setStravaLoading(false));
+  }, [stravaToken]);
+
+  // Strava: lazy-load GPS route when a Strava activity is selected
+  useEffect(() => {
+    const sel = WORKOUTS_EFF[workoutIdx];
+    if (!sel?.stravaId || sel.route || !stravaToken) return;
+    fetch(`https://www.strava.com/api/v3/activities/${sel.stravaId}/streams?keys=latlng&key_by_type=true`, {
+      headers: { Authorization: `Bearer ${stravaToken}` },
+    })
+    .then(r => r.json())
+    .then(data => {
+      const pts = data.latlng?.data;
+      if (!pts?.length) return;
+      const step = Math.max(1, Math.floor(pts.length / 600));
+      const route = pts.filter((_, i) => i % step === 0);
+      setStravaActs(prev => prev.map(a => a.stravaId === sel.stravaId ? { ...a, route } : a));
+    })
+    .catch(() => {});
+  }, [workoutIdx, stravaToken]);
 
   const share = useCallback(async () => {
     if (!exportRef.current) return;
@@ -937,6 +1032,29 @@ function App() {
         {/* Logo */}
         <div style={{ fontSize:11, fontWeight:700, letterSpacing:"0.14em", color:"rgba(255,255,255,0.28)", textTransform:"uppercase", marginBottom:22 }}>
           Garmin Poster
+        </div>
+
+        {/* ── Strava Connect ── */}
+        <div className="upload-row" onClick={() => {
+          if (stravaToken) {
+            localStorage.removeItem("strava_token");
+            localStorage.removeItem("strava_token_expiry");
+            setStravaToken(null); setStravaActs([]);
+          } else {
+            window.location.href = `https://www.strava.com/oauth/authorize?client_id=${STRAVA_CLIENT_ID}&redirect_uri=${encodeURIComponent(STRAVA_REDIRECT_URI)}&response_type=code&scope=${STRAVA_SCOPE}`;
+          }
+        }} style={{ marginBottom:20 }}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" style={{flexShrink:0}}>
+            <path d="M15.387 17.944l-2.089-4.116h-3.065L15.387 24l5.15-10.172h-3.066m-7.008-5.599l2.836 5.598h4.172L10.463 0l-7 13.828h4.169"
+              fill={stravaToken ? "#FC4C02" : "rgba(255,255,255,0.45)"}/>
+          </svg>
+          <span style={{color: stravaToken ? "rgba(255,255,255,0.85)" : "rgba(255,255,255,0.55)", fontSize:13}}>
+            {stravaLoading ? "Loading…" : stravaToken ? `Strava (${stravaActs.length} activities)` : "Connect Strava"}
+          </span>
+          {stravaToken && (
+            <div style={{ marginLeft:"auto",width:16,height:16,borderRadius:"50%",background:"rgba(255,255,255,0.15)",
+              cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,color:"#fff",flexShrink:0 }}>✕</div>
+          )}
         </div>
 
         {/* ── GPX Upload ── */}
